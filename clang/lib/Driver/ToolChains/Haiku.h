@@ -61,6 +61,9 @@ public:
   CXXStdlibType GetDefaultCXXStdlibType() const override;
   void addLibCxxIncludePaths(const llvm::opt::ArgList &DriverArgs,
                              llvm::opt::ArgStringList &CC1Args) const override;
+
+  const char *getDefaultLinker() const override { return "ld.lld"; }
+
   void
   addLibStdCxxIncludePaths(const llvm::opt::ArgList &DriverArgs,
                            llvm::opt::ArgStringList &CC1Args) const override;
@@ -71,22 +74,13 @@ public:
   void AddHIPIncludeArgs(const llvm::opt::ArgList &DriverArgs,
                          llvm::opt::ArgStringList &CC1Args) const override;
 
-  llvm::ExceptionHandling
-  GetExceptionModel(const llvm::opt::ArgList &Args) const override;
   bool IsUnwindTablesDefault(const llvm::opt::ArgList &Args) const override;
+  bool isPICDefault() const override;
   bool isPIEDefault(const llvm::opt::ArgList &Args) const override;
-  SanitizerMask getSupportedSanitizers() const override;
   unsigned GetDefaultDwarfVersion() const override;
-  // Until dtrace (via CTF) and LLDB can deal with distributed debug info,
-  // Haiku defaults to standalone/full debug info.
-  bool GetDefaultStandaloneDebug() const override { return true; }
-  void
-  addClangTargetOptions(const llvm::opt::ArgList &DriverArgs,
-                        llvm::opt::ArgStringList &CC1Args,
-                        Action::OffloadKind DeviceOffloadKind) const override;
+  bool GetDefaultStandaloneDebug() const override;
 
 protected:
-  Tool *buildAssembler() const override;
   Tool *buildLinker() const override;
 };
 

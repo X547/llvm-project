@@ -306,7 +306,7 @@ public:
     this->IntPtrType = TargetInfo::SignedLong;
     this->PtrDiffType = TargetInfo::SignedLong;
     this->ProcessIDType = TargetInfo::SignedLong;
-    this->TLSSupported = false;
+    this->TLSSupported = true;
     switch (Triple.getArch()) {
     default:
       break;
