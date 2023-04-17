@@ -211,7 +211,7 @@ Tool *Haiku::buildLinker() const { return new tools::haiku::Linker(*this); }
 
 bool Haiku::HasNativeLLVMSupport() const { return true; }
 
-bool Haiku::IsUnwindTablesDefault(const ArgList &Args) const { return true; }
+ToolChain::UnwindTableLevel Haiku::getDefaultUnwindTableLevel(const ArgList &Args) const { return UnwindTableLevel::Asynchronous;; }
 
 bool Haiku::isPICDefault() const { return true; }
 

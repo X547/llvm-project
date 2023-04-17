@@ -74,7 +74,7 @@ public:
   void AddHIPIncludeArgs(const llvm::opt::ArgList &DriverArgs,
                          llvm::opt::ArgStringList &CC1Args) const override;
 
-  bool IsUnwindTablesDefault(const llvm::opt::ArgList &Args) const override;
+  ToolChain::UnwindTableLevel getDefaultUnwindTableLevel(const llvm::opt::ArgList &Args) const override;
   bool isPICDefault() const override;
   bool isPIEDefault(const llvm::opt::ArgList &Args) const override;
   unsigned GetDefaultDwarfVersion() const override;
