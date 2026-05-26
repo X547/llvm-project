@@ -1,0 +1,33 @@
+## Roundtrip a versioned IFS through ELF and verify the resulting IFS preserves
+## Versions and per-symbol Version / VersionHidden.
+
+# RUN: llvm-ifs --output-elf=%t.elf --target=x86_64-linux-gnu %s
+# RUN: llvm-ifs --output-ifs=%t.ifs --hint-ifs-target=x86_64-linux-gnu %t.elf
+# RUN: FileCheck %s --input-file %t.ifs
+
+# CHECK: --- !ifs-v1
+# CHECK: IfsVersion: 3.0
+# CHECK: SoName: libtest.so
+# CHECK: Versions:
+# CHECK-NEXT:   - Name: V_1
+# CHECK-NEXT:   - Name: V_2
+# CHECK-NEXT:     Parents:
+# CHECK-NEXT:       - V_1
+# CHECK: Symbols:
+# CHECK-DAG: - { Name: bar, Type: Func, Version: V_2, VersionHidden: true }
+# CHECK-DAG: - { Name: baz, Type: Func }
+# CHECK-DAG: - { Name: foo, Type: Func, Version: V_1 }
+
+--- !ifs-v1
+IfsVersion: 3.0
+SoName: libtest.so
+Versions:
+  - Name: V_1
+  - Name: V_2
+    Parents:
+      - V_1
+Symbols:
+  - { Name: foo, Type: Func, Version: V_1 }
+  - { Name: bar, Type: Func, Version: V_2, VersionHidden: true }
+  - { Name: baz, Type: Func }
+...

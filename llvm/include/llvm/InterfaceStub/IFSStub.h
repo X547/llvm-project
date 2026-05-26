@@ -59,8 +59,26 @@ struct IFSSymbol {
   bool Undefined = false;
   bool Weak = false;
   std::optional<std::string> Warning;
+  std::optional<std::string> Version;
+  bool VersionHidden = false;
   bool operator<(const IFSSymbol &RHS) const { return Name < RHS.Name; }
 };
+
+// A GNU symbol version definition entry (analogue of ElfXX_Verdef).
+// The base verdef (VER_FLG_BASE) is synthesized from IFSStub::SoName on write
+// and skipped on read, so this list only contains non-base versions.
+struct IFSVersion {
+  std::string Name;
+  std::vector<std::string> Parents;
+};
+
+inline bool operator==(const IFSVersion &Lhs, const IFSVersion &Rhs) {
+  return Lhs.Name == Rhs.Name && Lhs.Parents == Rhs.Parents;
+}
+
+inline bool operator!=(const IFSVersion &Lhs, const IFSVersion &Rhs) {
+  return !(Lhs == Rhs);
+}
 
 struct IFSTarget {
   std::optional<std::string> Triple;
@@ -88,11 +106,11 @@ inline bool operator!=(const IFSTarget &Lhs, const IFSTarget &Rhs) {
 // A cumulative representation of InterFace stubs.
 // Both textual and binary stubs will read into and write from this object.
 struct IFSStub {
-  // TODO: Add support for symbol versioning.
   VersionTuple IfsVersion;
   std::optional<std::string> SoName;
   IFSTarget Target;
   std::vector<std::string> NeededLibs;
+  std::vector<IFSVersion> Versions;
   std::vector<IFSSymbol> Symbols;
 
   IFSStub() = default;

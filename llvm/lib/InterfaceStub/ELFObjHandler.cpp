@@ -7,6 +7,8 @@
 //===-----------------------------------------------------------------------===/
 
 #include "llvm/InterfaceStub/ELFObjHandler.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/InterfaceStub/IFSStub.h"
 #include "llvm/MC/StringTableBuilder.h"
 #include "llvm/Object/Binary.h"
@@ -40,6 +42,15 @@ struct DynamicEntries {
   std::optional<uint64_t> ElfHash;
   std::optional<uint64_t> GnuHash;
 };
+
+/// Map from a dynamic symbol index to its GNU version index (raw vs_index,
+/// including the VERSYM_HIDDEN bit). Empty when the binary has no versym
+/// section.
+using VersymTable = std::vector<uint16_t>;
+
+/// Map from a verdef vd_ndx to its version name. Index 0 and 1 are reserved
+/// (VER_NDX_LOCAL and VER_NDX_GLOBAL) and never appear here.
+using VerdefNameMap = DenseMap<uint16_t, std::string>;
 
 /// This initializes an ELF file header with information specific to a binary
 /// dynamic shared object.
@@ -124,6 +135,111 @@ private:
   llvm::SmallVector<Elf_Sym, 8> Symbols;
 };
 
+template <class ELFT> class ELFVerdefBuilder {
+public:
+  using Elf_Verdef = typename ELFT::Verdef;
+  using Elf_Verdaux = typename ELFT::Verdaux;
+
+  struct Entry {
+    std::string Name;
+    SmallVector<std::string, 1> Parents;
+    uint16_t Flags = 0;
+    uint16_t Ndx = 0;
+  };
+
+  // Append the base verdef (VER_FLG_BASE), whose name is the library SoName.
+  // Returns its assigned vd_ndx.
+  uint16_t addBase(StringRef Name) {
+    Entry E;
+    E.Name = std::string(Name);
+    E.Flags = VER_FLG_BASE;
+    E.Ndx = ++NextNdx;
+    uint16_t Ndx = E.Ndx;
+    Entries.push_back(std::move(E));
+    return Ndx;
+  }
+
+  // Append a non-base verdef. Returns its assigned vd_ndx.
+  uint16_t addVersion(StringRef Name, ArrayRef<std::string> Parents) {
+    Entry E;
+    E.Name = std::string(Name);
+    for (StringRef P : Parents)
+      E.Parents.push_back(std::string(P));
+    E.Ndx = ++NextNdx;
+    uint16_t Ndx = E.Ndx;
+    Entries.push_back(std::move(E));
+    return Ndx;
+  }
+
+  size_t getCount() const { return Entries.size(); }
+
+  size_t getSize() const {
+    size_t Size = 0;
+    for (const Entry &E : Entries)
+      Size += sizeof(Elf_Verdef) + (1 + E.Parents.size()) * sizeof(Elf_Verdaux);
+    return Size;
+  }
+
+  void write(uint8_t *Buf, const StringTableBuilder &DynStr) const {
+    size_t Off = 0;
+    for (size_t I = 0; I < Entries.size(); ++I) {
+      const Entry &E = Entries[I];
+      auto *VD = reinterpret_cast<Elf_Verdef *>(Buf + Off);
+      size_t EntrySize =
+          sizeof(Elf_Verdef) + (1 + E.Parents.size()) * sizeof(Elf_Verdaux);
+      VD->vd_version = VER_DEF_CURRENT;
+      VD->vd_flags = E.Flags;
+      VD->vd_ndx = E.Ndx;
+      VD->vd_cnt = 1 + E.Parents.size();
+      VD->vd_hash = hashSysV(E.Name);
+      VD->vd_aux = sizeof(Elf_Verdef);
+      VD->vd_next = (I + 1 == Entries.size()) ? 0 : EntrySize;
+      Off += sizeof(Elf_Verdef);
+
+      auto WriteAux = [&](StringRef N, bool Last) {
+        auto *VA = reinterpret_cast<Elf_Verdaux *>(Buf + Off);
+        VA->vda_name = DynStr.getOffset(N);
+        VA->vda_next = Last ? 0 : sizeof(Elf_Verdaux);
+        Off += sizeof(Elf_Verdaux);
+      };
+      WriteAux(E.Name, E.Parents.empty());
+      for (size_t J = 0; J < E.Parents.size(); ++J)
+        WriteAux(E.Parents[J], J + 1 == E.Parents.size());
+    }
+  }
+
+private:
+  SmallVector<Entry, 8> Entries;
+  uint16_t NextNdx = 0;
+};
+
+template <class ELFT> class ELFVersymBuilder {
+public:
+  using Elf_Versym = typename ELFT::Versym;
+
+  // The leading entry corresponds to the NULL dynsym slot.
+  ELFVersymBuilder() { Entries.push_back(makeEntry(VER_NDX_LOCAL, false)); }
+
+  void add(uint16_t Ndx, bool Hidden) {
+    Entries.push_back(makeEntry(Ndx, Hidden));
+  }
+
+  size_t getSize() const { return Entries.size() * sizeof(Elf_Versym); }
+
+  void write(uint8_t *Buf) const {
+    memcpy(Buf, Entries.data(), getSize());
+  }
+
+private:
+  static Elf_Versym makeEntry(uint16_t Ndx, bool Hidden) {
+    Elf_Versym V{};
+    V.vs_index = Ndx | (Hidden ? VERSYM_HIDDEN : 0);
+    return V;
+  }
+
+  SmallVector<Elf_Versym, 8> Entries;
+};
+
 template <class ELFT> class ELFDynamicTableBuilder {
 public:
   using Elf_Dyn = typename ELFT::Dyn;
@@ -188,6 +304,12 @@ public:
     DynTab.Align = sizeof(Elf_Addr);
     ShStrTab.Name = ".shstrtab";
     ShStrTab.Align = 1;
+    VerDef.Name = ".gnu.version_d";
+    VerDef.Align = sizeof(uint64_t);
+    VerSym.Name = ".gnu.version";
+    VerSym.Align = sizeof(typename ELFT::Half);
+
+    HasVersions = !Stub.Versions.empty();
 
     // Populate string tables.
     for (const IFSSymbol &Sym : Stub.Symbols)
@@ -196,9 +318,18 @@ public:
       DynStr.Content.add(Lib);
     if (Stub.SoName)
       DynStr.Content.add(*Stub.SoName);
+    if (HasVersions) {
+      for (const IFSVersion &V : Stub.Versions) {
+        DynStr.Content.add(V.Name);
+        for (const std::string &P : V.Parents)
+          DynStr.Content.add(P);
+      }
+    }
 
-    std::vector<OutputSection<ELFT> *> Sections = {&DynSym, &DynStr, &DynTab,
-                                                   &ShStrTab};
+    std::vector<OutputSection<ELFT> *> Sections = {&DynSym, &DynStr};
+    if (HasVersions)
+      Sections.insert(Sections.end(), {&VerDef, &VerSym});
+    Sections.insert(Sections.end(), {&DynTab, &ShStrTab});
     const OutputSection<ELFT> *LastSection = Sections.back();
     // Now set the Index and put sections names into ".shstrtab".
     uint64_t Index = 1;
@@ -211,6 +342,21 @@ public:
     DynStr.Content.finalize();
     DynStr.Size = DynStr.Content.getSize();
 
+    // Build the verdef table (base from SoName, then user-defined versions)
+    // and remember each version's vd_ndx so per-symbol versyms can reference
+    // it.
+    llvm::StringMap<uint16_t> VersionIndex;
+    if (HasVersions) {
+      assert(Stub.SoName &&
+             "Stub.SoName is required when Stub.Versions is non-empty");
+      VerDef.Content.addBase(*Stub.SoName);
+      for (const IFSVersion &V : Stub.Versions) {
+        uint16_t Ndx = VerDef.Content.addVersion(V.Name, V.Parents);
+        VersionIndex[V.Name] = Ndx;
+      }
+      VerDef.Size = VerDef.Content.getSize();
+    }
+
     // Populate dynamic symbol table.
     for (const IFSSymbol &Sym : Stub.Symbols) {
       uint8_t Bind = Sym.Weak ? STB_WEAK : STB_GLOBAL;
@@ -221,8 +367,19 @@ public:
       uint64_t Size = Sym.Size.value_or(0);
       DynSym.Content.add(DynStr.Content.getOffset(Sym.Name), Size, Bind,
                          convertIFSSymbolTypeToELF(Sym.Type), 0, Shndx);
+      if (HasVersions) {
+        uint16_t Ndx = VER_NDX_GLOBAL;
+        if (Sym.Version) {
+          auto It = VersionIndex.find(*Sym.Version);
+          if (It != VersionIndex.end())
+            Ndx = It->second;
+        }
+        VerSym.Content.add(Ndx, Sym.VersionHidden);
+      }
     }
     DynSym.Size = DynSym.Content.getSize();
+    if (HasVersions)
+      VerSym.Size = VerSym.Content.getSize();
 
     // Poplulate dynamic table.
     size_t DynSymIndex = DynTab.Content.addAddr(DT_SYMTAB, 0);
@@ -233,6 +390,13 @@ public:
     if (Stub.SoName)
       DynTab.Content.addValue(DT_SONAME,
                               DynStr.Content.getOffset(*Stub.SoName));
+    size_t VerDefIndex = 0;
+    size_t VerSymIndex = 0;
+    if (HasVersions) {
+      VerDefIndex = DynTab.Content.addAddr(DT_VERDEF, 0);
+      DynTab.Content.addValue(DT_VERDEFNUM, VerDef.Content.getCount());
+      VerSymIndex = DynTab.Content.addAddr(DT_VERSYM, 0);
+    }
     DynTab.Size = DynTab.Content.getSize();
     // Calculate sections' addresses and offsets.
     uint64_t CurrentOffset = sizeof(Elf_Ehdr);
@@ -244,11 +408,19 @@ public:
     // Fill Addr back to dynamic table.
     DynTab.Content.modifyAddr(DynSymIndex, DynSym.Addr);
     DynTab.Content.modifyAddr(DynStrIndex, DynStr.Addr);
+    if (HasVersions) {
+      DynTab.Content.modifyAddr(VerDefIndex, VerDef.Addr);
+      DynTab.Content.modifyAddr(VerSymIndex, VerSym.Addr);
+    }
     // Write section headers of string tables.
     fillSymTabShdr(DynSym, SHT_DYNSYM);
     fillStrTabShdr(DynStr, SHF_ALLOC);
     fillDynTabShdr(DynTab);
     fillStrTabShdr(ShStrTab);
+    if (HasVersions) {
+      fillVerDefShdr(VerDef);
+      fillVerSymShdr(VerSym);
+    }
 
     // Finish initializing the ELF header.
     initELFHeader<ELFT>(ElfHeader, static_cast<uint16_t>(*Stub.Target.Arch));
@@ -272,6 +444,12 @@ public:
     writeShdr(Data, DynStr);
     writeShdr(Data, DynTab);
     writeShdr(Data, ShStrTab);
+    if (HasVersions) {
+      VerDef.Content.write(Data + VerDef.Shdr.sh_offset, DynStr.Content);
+      VerSym.Content.write(Data + VerSym.Shdr.sh_offset);
+      writeShdr(Data, VerDef);
+      writeShdr(Data, VerSym);
+    }
   }
 
 private:
@@ -280,6 +458,9 @@ private:
   ContentSection<ELFStringTableBuilder, ELFT> ShStrTab;
   ContentSection<ELFSymbolTableBuilder<ELFT>, ELFT> DynSym;
   ContentSection<ELFDynamicTableBuilder<ELFT>, ELFT> DynTab;
+  ContentSection<ELFVerdefBuilder<ELFT>, ELFT> VerDef;
+  ContentSection<ELFVersymBuilder<ELFT>, ELFT> VerSym;
+  bool HasVersions = false;
 
   template <class T> static void write(uint8_t *Data, const T &Value) {
     *reinterpret_cast<T *>(Data) = Value;
@@ -326,6 +507,33 @@ private:
     DynTab.Shdr.sh_addralign = DynTab.Align;
     DynTab.Shdr.sh_entsize = sizeof(Elf_Dyn);
     DynTab.Shdr.sh_link = this->DynStr.Index;
+  }
+  void fillVerDefShdr(
+      ContentSection<ELFVerdefBuilder<ELFT>, ELFT> &Sec) const {
+    Sec.Shdr.sh_type = SHT_GNU_verdef;
+    Sec.Shdr.sh_flags = SHF_ALLOC;
+    Sec.Shdr.sh_addr = Sec.Addr;
+    Sec.Shdr.sh_offset = Sec.Offset;
+    // sh_info holds the number of verdef entries (including the base).
+    Sec.Shdr.sh_info = Sec.Content.getCount();
+    Sec.Shdr.sh_size = Sec.Size;
+    Sec.Shdr.sh_name = this->ShStrTab.Content.getOffset(Sec.Name);
+    Sec.Shdr.sh_addralign = Sec.Align;
+    Sec.Shdr.sh_entsize = 0;
+    Sec.Shdr.sh_link = this->DynStr.Index;
+  }
+  void fillVerSymShdr(
+      ContentSection<ELFVersymBuilder<ELFT>, ELFT> &Sec) const {
+    Sec.Shdr.sh_type = SHT_GNU_versym;
+    Sec.Shdr.sh_flags = SHF_ALLOC;
+    Sec.Shdr.sh_addr = Sec.Addr;
+    Sec.Shdr.sh_offset = Sec.Offset;
+    Sec.Shdr.sh_info = 0;
+    Sec.Shdr.sh_size = Sec.Size;
+    Sec.Shdr.sh_name = this->ShStrTab.Content.getOffset(Sec.Name);
+    Sec.Shdr.sh_addralign = Sec.Align;
+    Sec.Shdr.sh_entsize = sizeof(typename ELFT::Versym);
+    Sec.Shdr.sh_link = this->DynSym.Index;
   }
   uint64_t shdrOffset(const OutputSection<ELFT> &Sec) const {
     return ElfHeader.e_shoff + Sec.Index * sizeof(Elf_Shdr);
@@ -543,12 +751,17 @@ static IFSSymbol createELFSym(StringRef SymName,
 /// @param TargetStub IFSStub to add symbols to.
 /// @param DynSym Range of dynamic symbols to add to TargetStub.
 /// @param DynStr StringRef to the dynamic string table.
+/// @param Versyms Parallel-to-DynSym GNU version indices (empty if the binary
+///        has no .gnu.version section).
+/// @param VerdefNames Map from a verdef vd_ndx to the verdef's name.
 template <class ELFT>
 static Error populateSymbols(IFSStub &TargetStub,
                              const typename ELFT::SymRange DynSym,
-                             StringRef DynStr) {
+                             StringRef DynStr, const VersymTable &Versyms,
+                             const VerdefNameMap &VerdefNames) {
   // Skips the first symbol since it's the NULL symbol.
-  for (auto RawSym : DynSym.drop_front(1)) {
+  for (size_t I = 1; I < DynSym.size(); ++I) {
+    const auto &RawSym = DynSym[I];
     // If a symbol does not have global or weak binding, ignore it.
     uint8_t Binding = RawSym.getBinding();
     if (!(Binding == STB_GLOBAL || Binding == STB_WEAK))
@@ -563,6 +776,19 @@ static Error populateSymbols(IFSStub &TargetStub,
     if (!SymName)
       return SymName.takeError();
     IFSSymbol Sym = createELFSym<ELFT>(*SymName, RawSym);
+    // Attach GNU symbol versioning info if present.
+    if (I < Versyms.size()) {
+      uint16_t Raw = Versyms[I];
+      uint16_t Ndx = Raw & VERSYM_VERSION;
+      // VER_NDX_LOCAL (0) and VER_NDX_GLOBAL (1) are the unversioned slots.
+      if (Ndx > VER_NDX_GLOBAL) {
+        auto It = VerdefNames.find(Ndx);
+        if (It != VerdefNames.end()) {
+          Sym.Version = It->second;
+          Sym.VersionHidden = (Raw & VERSYM_HIDDEN) != 0;
+        }
+      }
+    }
     TargetStub.Symbols.push_back(std::move(Sym));
     // TODO: Populate symbol warning.
   }
@@ -627,6 +853,61 @@ buildStub(const ELFObjectFile<ELFT> &ElfObj) {
     DestStub->NeededLibs.push_back(std::string(*LibNameOrErr));
   }
 
+  // Locate optional GNU symbol-versioning sections (.gnu.version_d and
+  // .gnu.version). DT_VERNEED is intentionally not supported here; IFS only
+  // describes the library's exported surface.
+  using Elf_Shdr = typename ELFT::Shdr;
+  using Elf_Versym = typename ELFT::Versym;
+  Expected<typename ELFT::ShdrRange> ShdrsOrErr = ElfFile.sections();
+  if (!ShdrsOrErr)
+    return ShdrsOrErr.takeError();
+  const Elf_Shdr *VerdefSec = nullptr;
+  const Elf_Shdr *VersymSec = nullptr;
+  for (const Elf_Shdr &Sec : *ShdrsOrErr) {
+    if (Sec.sh_type == SHT_GNU_verdef)
+      VerdefSec = &Sec;
+    else if (Sec.sh_type == SHT_GNU_versym)
+      VersymSec = &Sec;
+  }
+
+  VerdefNameMap VerdefNames;
+  if (VerdefSec) {
+    Expected<std::vector<object::VerDef>> DefsOrErr =
+        ElfFile.getVersionDefinitions(*VerdefSec);
+    if (!DefsOrErr)
+      return appendToError(DefsOrErr.takeError(),
+                           "when reading version definitions");
+    for (const object::VerDef &Def : *DefsOrErr) {
+      // Skip the base verdef; it is synthesized from SoName on write.
+      if (Def.Flags & VER_FLG_BASE)
+        continue;
+      IFSVersion V;
+      V.Name = Def.Name;
+      for (const object::VerdAux &Aux : Def.AuxV)
+        V.Parents.push_back(Aux.Name);
+      VerdefNames.try_emplace(Def.Ndx & VERSYM_VERSION, Def.Name);
+      DestStub->Versions.push_back(std::move(V));
+    }
+  }
+
+  VersymTable Versyms;
+  if (VersymSec) {
+    Expected<ArrayRef<uint8_t>> ContentsOrErr =
+        ElfFile.getSectionContents(*VersymSec);
+    if (!ContentsOrErr)
+      return appendToError(ContentsOrErr.takeError(),
+                           "when reading .gnu.version contents");
+    if (ContentsOrErr->size() % sizeof(Elf_Versym) != 0)
+      return createError(".gnu.version section size is not a multiple of "
+                         "Elf_Versym size");
+    size_t N = ContentsOrErr->size() / sizeof(Elf_Versym);
+    const auto *Entries =
+        reinterpret_cast<const Elf_Versym *>(ContentsOrErr->data());
+    Versyms.reserve(N);
+    for (size_t I = 0; I < N; ++I)
+      Versyms.push_back(Entries[I].vs_index);
+  }
+
   // Populate Symbols from .dynsym table and dynamic string table.
   Expected<uint64_t> SymCount = ElfFile.getDynSymtabSize();
   if (!SymCount)
@@ -639,7 +920,8 @@ buildStub(const ELFObjectFile<ELFT> &ElfObj) {
                            "when locating .dynsym section contents");
     Elf_Sym_Range DynSyms = ArrayRef<Elf_Sym>(
         reinterpret_cast<const Elf_Sym *>(*DynSymPtr), *SymCount);
-    Error SymReadError = populateSymbols<ELFT>(*DestStub, DynSyms, DynStr);
+    Error SymReadError =
+        populateSymbols<ELFT>(*DestStub, DynSyms, DynStr, Versyms, VerdefNames);
     if (SymReadError)
       return appendToError(std::move(SymReadError),
                            "when reading dynamic symbols");
@@ -714,6 +996,11 @@ Error writeBinaryStub(StringRef FilePath, const IFSStub &Stub,
   assert(Stub.Target.Arch);
   assert(Stub.Target.BitWidth);
   assert(Stub.Target.Endianness);
+  if (!Stub.Versions.empty() && !Stub.SoName)
+    return createStringError(
+        errc::invalid_argument,
+        "SoName is required when Versions are present (used as the base "
+        "verdef name)");
   if (Stub.Target.BitWidth == IFSBitWidthType::IFS32) {
     if (Stub.Target.Endianness == IFSEndiannessType::Little) {
       return writeELFBinaryToFile<ELF32LE>(FilePath, Stub, WriteIfChanged);

@@ -9,6 +9,7 @@
 #include "llvm/InterfaceStub/IFSHandler.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/InterfaceStub/IFSStub.h"
@@ -24,6 +25,7 @@ using namespace llvm;
 using namespace llvm::ifs;
 
 LLVM_YAML_IS_SEQUENCE_VECTOR(IFSSymbol)
+LLVM_YAML_IS_SEQUENCE_VECTOR(IFSVersion)
 
 namespace llvm {
 namespace yaml {
@@ -129,10 +131,20 @@ template <> struct MappingTraits<IFSSymbol> {
     IO.mapOptional("Undefined", Symbol.Undefined, false);
     IO.mapOptional("Weak", Symbol.Weak, false);
     IO.mapOptional("Warning", Symbol.Warning);
+    IO.mapOptional("Version", Symbol.Version);
+    IO.mapOptional("VersionHidden", Symbol.VersionHidden, false);
   }
 
   // Compacts symbol information into a single line.
   static const bool flow = true; // NOLINT(readability-identifier-naming)
+};
+
+/// YAML traits for IFSVersion.
+template <> struct MappingTraits<IFSVersion> {
+  static void mapping(IO &IO, IFSVersion &Version) {
+    IO.mapRequired("Name", Version.Name);
+    IO.mapOptional("Parents", Version.Parents);
+  }
 };
 
 /// YAML traits for ELFStub objects.
@@ -144,6 +156,7 @@ template <> struct MappingTraits<IFSStub> {
     IO.mapOptional("SoName", Stub.SoName);
     IO.mapOptional("Target", Stub.Target);
     IO.mapOptional("NeededLibs", Stub.NeededLibs);
+    IO.mapOptional("Versions", Stub.Versions);
     IO.mapRequired("Symbols", Stub.Symbols);
   }
 };
@@ -157,6 +170,7 @@ template <> struct MappingTraits<IFSStubTriple> {
     IO.mapOptional("SoName", Stub.SoName);
     IO.mapOptional("Target", Stub.Target.Triple);
     IO.mapOptional("NeededLibs", Stub.NeededLibs);
+    IO.mapOptional("Versions", Stub.Versions);
     IO.mapRequired("Symbols", Stub.Symbols);
   }
 };
@@ -206,6 +220,27 @@ Expected<std::unique_ptr<IFSStub>> ifs::readIFSFromBuffer(StringRef Buf) {
       return createStringError(
           std::make_error_code(std::errc::invalid_argument),
           "IFS symbol type for symbol '" + Item.Name + "' is unsupported");
+  }
+  // Validate that symbol Version references and Parents references resolve to
+  // a declared IFSVersion entry.
+  llvm::StringSet<> VersionNames;
+  for (const auto &V : Stub->Versions)
+    VersionNames.insert(V.Name);
+  for (const auto &V : Stub->Versions) {
+    for (const auto &P : V.Parents) {
+      if (!VersionNames.contains(P))
+        return createStringError(
+            std::make_error_code(std::errc::invalid_argument),
+            "IFS version '" + V.Name + "' references unknown parent '" + P +
+                "'");
+    }
+  }
+  for (const auto &Sym : Stub->Symbols) {
+    if (Sym.Version && !VersionNames.contains(*Sym.Version))
+      return createStringError(
+          std::make_error_code(std::errc::invalid_argument),
+          "IFS symbol '" + Sym.Name + "' references unknown version '" +
+              *Sym.Version + "'");
   }
   return std::move(Stub);
 }

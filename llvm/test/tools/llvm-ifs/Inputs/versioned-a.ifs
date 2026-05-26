@@ -1,0 +1,10 @@
+--- !ifs-v1
+IfsVersion: 3.0
+SoName: libtest.so
+Target: { ObjectFormat: ELF, Arch: x86_64, Endianness: little, BitWidth: 64 }
+Versions:
+  - Name: V_1
+  - Name: V_2
+Symbols:
+  - { Name: foo, Type: Func, Version: V_1 }
+...

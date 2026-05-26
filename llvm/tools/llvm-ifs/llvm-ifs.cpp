@@ -405,6 +405,7 @@ int llvm_ifs_main(int argc, char **argv, const llvm::ToolContext &) {
       Stub.Target = TargetStub->Target;
       Stub.SoName = TargetStub->SoName;
       Stub.NeededLibs = TargetStub->NeededLibs;
+      Stub.Versions = TargetStub->Versions;
     } else {
       if (Stub.IfsVersion != TargetStub->IfsVersion) {
         if (Stub.IfsVersion.getMajor() != IfsVersionCurrent.getMajor()) {
@@ -438,6 +439,12 @@ int llvm_ifs_main(int argc, char **argv, const llvm::ToolContext &) {
                            << InputFilePath << "\n";
         return -1;
       }
+      if (Stub.Versions != TargetStub->Versions) {
+        WithColor::error() << "Interface Stub: Versions Mismatch."
+                           << "\nFilenames: " << PreviousInputFilePath << " "
+                           << InputFilePath << "\n";
+        return -1;
+      }
     }
 
     for (auto Symbol : TargetStub->Symbols) {
@@ -467,6 +474,20 @@ int llvm_ifs_main(int argc, char **argv, const llvm::ToolContext &) {
       if (Symbol.Weak != SI->second.Weak) {
         Symbol.Weak = false;
         continue;
+      }
+      if (Symbol.Version != SI->second.Version) {
+        WithColor::error() << "Interface Stub: Version Mismatch for "
+                           << Symbol.Name << ".\nFilename: " << InputFilePath
+                           << "\nVersion Values: "
+                           << SI->second.Version.value_or("") << " "
+                           << Symbol.Version.value_or("") << "\n";
+        return -1;
+      }
+      if (Symbol.VersionHidden != SI->second.VersionHidden) {
+        WithColor::error()
+            << "Interface Stub: VersionHidden Mismatch for " << Symbol.Name
+            << ".\nFilename: " << InputFilePath << "\n";
+        return -1;
       }
       // TODO: Not checking Warning. Will be dropped.
     }

@@ -1,0 +1,18 @@
+## Merging two IFS stubs that disagree on either the Versions list or a symbol's
+## Version must fail. Matching stubs merge cleanly.
+
+# RUN: llvm-ifs --output-ifs=%t.merged %S/Inputs/versioned-a.ifs %S/Inputs/versioned-a.ifs
+# RUN: FileCheck %s --check-prefix=OK --input-file %t.merged
+
+# RUN: not llvm-ifs --output-ifs=- %S/Inputs/versioned-a.ifs %S/Inputs/versioned-mismatch-versions.ifs 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=VLIST
+
+# RUN: not llvm-ifs --output-ifs=- %S/Inputs/versioned-a.ifs %S/Inputs/versioned-mismatch-symver.ifs 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=VSYM
+
+# OK: Versions:
+# OK-NEXT:   - Name: V_1
+
+# VLIST: Versions Mismatch
+
+# VSYM: Version Mismatch for foo
